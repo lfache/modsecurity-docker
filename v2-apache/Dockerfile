@@ -1,14 +1,11 @@
-FROM httpd:2.4 as build
-
-LABEL version="2.9.3"
-LABEL maintainer="Chaim Sanders <chaim.sanders@gmail.com>"
-
+FROM httpd:2.4 as builder
 RUN apt-get update \
  && apt-get install -y --no-install-recommends --no-install-suggests \
+#RUN rm -f /etc/apt/apt.conf.d/docker-clean; echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
+#RUN --mount=type=cache,target=/var/cache/apt --mount=type=cache,target=/var/lib/apt \
+#  apt update && apt-get install -y --no-install-recommends --no-install-suggests \
       automake \
-      ca-certificates \
       g++ \
-      git \
       libcurl4-gnutls-dev \
       libpcre++-dev \
       libtool \
@@ -16,22 +13,15 @@ RUN apt-get update \
       libyajl-dev \
       lua5.2-dev \
       make \
-      pkgconf \
-      wget
+      openssl \
+      pkgconf 
 
-RUN wget --quiet https://github.com/ssdeep-project/ssdeep/releases/download/release-2.14.1/ssdeep-2.14.1.tar.gz \
- && tar -xvzf ssdeep-2.14.1.tar.gz \
+FROM builder as builder-ssdeep
+ADD https://github.com/ssdeep-project/ssdeep/releases/download/release-2.14.1/ssdeep-2.14.1.tar.gz ./
+RUN tar -xvzf ssdeep-2.14.1.tar.gz \
  && cd ssdeep-2.14.1 \
  && ./configure \
- && make \
- && make install \
- && make clean
-
-RUN git clone https://github.com/SpiderLabs/ModSecurity --branch v2.9.3 --depth 1 \
- && cd ModSecurity \
- && ./autogen.sh \
- && ./configure \
- && make \
+ && make -j$(nproc) \
  && make install \
  && make clean
 
@@ -42,6 +32,21 @@ RUN openssl req -x509 -days 365 -new \
       -config /usr/share/TLS/openssl.conf \
       -keyout /usr/share/TLS/server.key \
       -out /usr/share/TLS/server.crt
+
+
+FROM alpine as base-git
+RUN apk --no-cache add git \
+ && git clone https://github.com/SpiderLabs/ModSecurity --branch v2.9.3 --depth 1
+
+
+FROM builder as builder-modsec
+COPY --from=base-git /ModSecurity ./ModSecurity  
+RUN cd ModSecurity \
+ && ./autogen.sh \
+ && ./configure \
+ && make -j$(nproc) \
+ && make install \
+ && make clean
 
 FROM httpd:2.4
 
@@ -102,13 +107,10 @@ RUN DEBIAN_FRONTEND=noninteractive \
  && mkdir -p /etc/modsecurity.d/ \
  && mkdir -p /var/log/apache2/
 
-COPY --from=build /usr/local/apache2/modules/mod_security2.so                  /usr/local/apache2/modules/mod_security2.so
-COPY --from=build /usr/local/apache2/ModSecurity/modsecurity.conf-recommended  /etc/modsecurity.d/modsecurity.conf
-COPY --from=build /usr/local/apache2/ModSecurity/unicode.mapping               /etc/modsecurity.d/unicode.mapping
-COPY --from=build /usr/local/lib/libfuzzy.so.2.1.0                             /usr/local/lib/libfuzzy.so.2.1.0
-COPY --from=build /usr/local/bin/ssdeep                                        /usr/local/bin/ssdeep
-COPY --from=build /usr/share/TLS/server.key                                    /usr/local/apache2/conf/server.key
-COPY --from=build /usr/share/TLS/server.crt                                    /usr/local/apache2/conf/server.crt
+COPY --from=builder-ssdeep /usr/local/lib/libfuzzy.so.2.1.0                             /usr/local/lib/libfuzzy.so.2.1.0
+COPY --from=builder-ssdeep /usr/local/bin/ssdeep                                        /usr/local/bin/ssdeep
+COPY --from=builder-ssdeep /usr/share/TLS/server.key                                    /usr/local/apache2/conf/server.key
+COPY --from=builder-ssdeep /usr/share/TLS/server.crt                                    /usr/local/apache2/conf/server.crt
 COPY src/etc/modsecurity.d/*.conf /etc/modsecurity.d/
 COPY v2-apache/conf/extra/*.conf /usr/local/apache2/conf/extra/
 
@@ -136,5 +138,9 @@ RUN sed -i -E 's|(Listen) [0-9]+|\1 ${PORT}|' /usr/local/apache2/conf/httpd.conf
 
 RUN chgrp -R 0 /var/log/ /usr/local/apache2/ \
  && chmod -R g=u /var/log/ /usr/local/apache2/
+
+COPY --from=builder-modsec /usr/local/apache2/modules/mod_security2.so                  /usr/local/apache2/modules/mod_security2.so
+COPY --from=builder-modsec /usr/local/apache2/ModSecurity/modsecurity.conf-recommended  /etc/modsecurity.d/modsecurity.conf
+COPY --from=builder-modsec /usr/local/apache2/ModSecurity/unicode.mapping               /etc/modsecurity.d/unicode.mapping
 
 CMD ["/usr/local/apache2/bin/apachectl", "-D", "FOREGROUND"]
